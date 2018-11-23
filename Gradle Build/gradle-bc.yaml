@@ -1,0 +1,211 @@
+apiVersion: v1
+kind: BuildConfig
+metadata:
+  creationTimestamp: null
+  name: io.dbob-soap
+spec:
+  nodeSelector: {}
+  output: {}
+  postCommit: {}
+  resources: {}
+  runPolicy: Serial
+  source:
+    type: None
+  strategy:
+    jenkinsPipelineStrategy:
+      env:
+      - name: HTTP_PROXY
+        value: http://bastion.bytewise.com.my:3128
+      - name: HTTPS_PROXY
+        value: http://bastion.bytewise.com.my:3128
+      - name: NO_PROXY
+        value: localhost,127.0.0.1,10.0.0.0/8,192.0.0.0/8,*.svc,*.bytewise.com.my*,docker-registry.default.svc:5000,c01con.bytewise.com.my:8443,docker-registry-default.c01paas.bytewise.com.my:443
+      - name: GRADLE_TOOL_ID
+        value: Gradle 4.10.1
+      - name: GRADLE_USER_HOME
+        value: /var/lib/jenkins
+      - name: SERVICE_VERSION
+        value: 1.1.0
+      - name: PREP_DIR
+        value: prep
+      - name: DEPLOY_DIR
+        value: ocp/deployments
+      - name: NAMESPACE_SIT
+        value: dbos-sit
+      - name: NAMESPACE_UAT
+        value: dbos-uat
+      - name: NAMESPACE_PROD
+        value: dbos-cv
+      - name: SERVICE_NAME
+        value: soap
+      - name: CLUSTER_URL_PROD
+        value: https://c01con.bytewise.com.my:8443
+      - name: PROD_REG_FQDN
+        value: docker-registry-default.c01paas.bytewise.com.my
+      - name: PROD_SA_TOKEN
+        value: 'SA token granted rolebinding'
+      - name: BASE_IMGSTREAM
+        value: redhat-openjdk18-openshift:1.4
+      - name: GIT_REPO
+        value: https://gitlab.example.com/
+      - name: GIT_BRANCH
+        value: release/production
+      jenkinsfile: |
+        pipeline {
+            agent any
+            tools {
+                gradle params.GRADLE_TOOL_ID
+            }
+            environment {
+                SIT_IMG_TAG = "${NAMESPACE_SIT}/${SERVICE_NAME}:${SERVICE_VERSION}-${env.BUILD_ID}"
+                SIT_IMG_LATEST_TAG = "${NAMESPACE_SIT}/${SERVICE_NAME}:latest"
+                UAT_IMG_TAG = "${NAMESPACE_UAT}/${SERVICE_NAME}:${SERVICE_VERSION}-${env.BUILD_ID}"
+                UAT_IMG_LATEST_TAG = "${NAMESPACE_UAT}/${SERVICE_NAME}:latest"
+                PROD_IMG_TAG = "${NAMESPACE_PROD}/${SERVICE_NAME}:${SERVICE_VERSION}-${env.BUILD_ID}"
+                PROD_IMG_LATEST_TAG = "${NAMESPACE_PROD}/${SERVICE_NAME}:latest"
+                SIT_INIT_IMG_TAG = "${NAMESPACE_SIT}/${SERVICE_NAME}-init:${SERVICE_VERSION}-${env.BUILD_ID}"
+                SIT_INIT_LATEST_IMG_TAG = "${NAMESPACE_SIT}/${SERVICE_NAME}-init:latest"
+                UAT_INIT_IMG_TAG = "${NAMESPACE_UAT}/${SERVICE_NAME}-init:${SERVICE_VERSION}-${env.BUILD_ID}"
+                UAT_INIT_LATEST_IMG_TAG = "${NAMESPACE_UAT}/${SERVICE_NAME}-init:latest"
+                PROD_INIT_IMG_TAG = "${NAMESPACE_PROD}/${SERVICE_NAME}-init:${SERVICE_VERSION}-${env.BUILD_ID}"
+                PROD_INIT_LATEST_IMG_TAG = "${NAMESPACE_PROD}/${SERVICE_NAME}-init:latest"
+                LOCAL_TOKEN = readFile('/var/run/secrets/kubernetes.io/serviceaccount/token').trim()
+            }
+            stages {
+                stage("SIT: Checking out source code") {
+                    steps {
+                        checkout changelog: false,
+                        poll: false,
+                        scm: [$class: 'GitSCM',
+                              branches: [[name: '${GIT_BRANCH}']],
+                              doGenerateSubmoduleConfigurations: false,
+                              extensions: [],
+                              submoduleCfg: [],
+                              userRemoteConfigs: [[credentialsId: 'jenkins-cv-repo-secret',
+                                                   url: '${GIT_REPO}']]]
+                        }
+                }
+                stage("SIT: Read SNAPSHOT build properties") {
+                    steps {
+                        dir('soap'){
+                            script {
+                                sh 'printenv'
+                                VERSION_SNAP = sh(returnStdout: true, script: "cat gradle.properties | grep dbobCoreVersion| cut -f2 -d'='| xargs").trim()
+                            }
+
+                        }
+                    }
+                }
+                stage("SIT: Assemble main code") {
+                    steps {
+                        dir('soap'){
+                            sh "echo Detected SNAPSHOT:${VERSION_SNAP}, start to assemble..."
+                            sh "gradle assemble"
+                        }
+                    }
+                }
+                stage("SIT: Preparing deployment area") {
+                    steps {
+                        dir('soap') {
+                            sh """
+                                rm -r ${PREP_DIR} || true
+                                mkdir -p ${PREP_DIR}
+                                tar -xvf main/build/distributions/docker-${VERSION_SNAP}.tar -C ${PREP_DIR}
+                                rm -r ${DEPLOY_DIR} || true
+                                mkdir -p ${DEPLOY_DIR}
+                                cp -rf ${PREP_DIR}/docker-${VERSION_SNAP}/* ${DEPLOY_DIR}/
+                            """
+                        }
+                    }
+                }
+                stage("SIT: Building main image") {
+                    steps {
+                        dir('soap') {
+                            sh """
+                            oc delete bc ${SERVICE_NAME} -n ${NAMESPACE_SIT} || true
+                            oc new-build --image-stream=${BASE_IMGSTREAM} --binary=true --name=${SERVICE_NAME} --to=${SIT_IMG_TAG} \
+                            -n ${NAMESPACE_SIT} --env=VERTX_CONFIG_PATH=conf/reference.hocon --env=JAVA_LIB_DIR=/deployments/lib
+                            oc start-build ${SERVICE_NAME} --from-dir=./ocp --follow --wait -n ${NAMESPACE_SIT}
+                            """
+                        }
+                    }
+                }
+                stage("SIT: Tagging built image(s) as latest") {
+                    steps {
+                        dir('soap') {
+                            sh """
+                            oc tag ${SIT_IMG_TAG} ${SIT_IMG_LATEST_TAG} -n ${NAMESPACE_SIT}
+                            """
+                        }
+                    }
+                }
+                stage("SIT: Rolling out deployment for latest image") {
+                    steps {
+                        dir('soap') {
+                            // TO-DO: SIT namespace need to be setup by CV before can test deployment
+                            sh "echo Deploying dummy SIT/DC"
+                            //sh "oc rollout latest dc/${SERVICE_NAME} -n ${NAMESPACE_SIT}"
+                        }
+                    }
+                }
+                stage("SIT-2-UAT: Promote to UAT") {
+                    steps {
+                        // submitter, allow only certain user to click approved.
+                        input message: 'Promote to UAT?', ok: 'Promote to UAT?', submitter: 'ocpadmin-admin'
+                        }
+                }
+                stage("SIT-2-UAT: Tagging image to UAT") {
+                    steps {
+                        dir('soap') {
+                            sh """
+                            oc tag ${SIT_IMG_TAG} ${UAT_IMG_TAG} -n ${NAMESPACE_SIT}
+                            oc tag ${UAT_IMG_TAG} ${UAT_IMG_LATEST_TAG} -n ${NAMESPACE_UAT}
+                            """
+                        }
+                    }
+                }
+                stage("UAT: Rolling out deployment for latest image") {
+                    steps {
+                        dir('soap') {
+                           // TO-DO: UAT namespace need to be setup by CV before can test deployment.
+                           sh "echo Deploying dummy UAT/DC"
+                           // sh "oc rollout latest dc/${PROJECT_NAME} -n ${NAMESPACE_UAT}"
+                        }
+                    }
+                }
+                stage("UAT-2-PROD: Promote to Production") {
+                    // submitter, allow only certain user to click approved.
+                    steps {
+                        input message: 'Promote to Production?', ok: 'Promote to Production?', submitter: 'ocpadmin-admin'
+                    }
+                }
+               stage("UAT-2-PROD: Promote built image to production") {
+                    agent { label 'skopeo-slave'}
+                        steps {
+                            // TO-DO: CV as code owner, need to verify the above pipeline and image produced is healthy before enable production promotion.
+                            //sh "echo Promoting to dummy PROD..."
+                            sh """
+                              skopeo copy --remove-signatures --src-creds openshift:${LOCAL_TOKEN} --dest-creds openshift:${PROD_SA_TOKEN} \
+                              --dest-tls-verify=false --src-tls-verify=false \
+                              docker://docker-registry.default.svc:5000/${UAT_IMG_TAG} docker://${PROD_REG_FQDN}/${PROD_IMG_TAG}
+                              oc login --insecure-skip-tls-verify=true --token ${PROD_SA_TOKEN} ${CLUSTER_URL_PROD} -n ${NAMESPACE_PROD}
+                              oc tag ${PROD_IMG_TAG} ${PROD_IMG_LATEST_TAG} -n ${NAMESPACE_PROD}
+                              """
+                        }
+                 }
+                stage("PROD: Rollout latest") {
+                    steps {
+                        // TO-DO: Bluegreen deployment need two different services and one route. https://docs.openshift.com/container-platform/3.3/dev_guide/deployments/advanced_deployment_strategies.html#advanced-deployment-strategies-blue-green-deployments-example
+                        sh "echo Deploying dummy PROD..."
+                        //sh """
+                        // oc login --insecure-skip-tls-verify=true --token ${PROD_SA_TOKEN} ${CLUSTER_URL_PROD} -n ${NAMESPACE_PROD}
+                        //oc rollout latest ${SERVICE_NAME} -n ${NAMESPACE_PROD}"
+                        //"""
+                    }
+                }
+            }
+        }
+    type: JenkinsPipeline
+  triggers: []
+status:
+  lastVersion: 0
